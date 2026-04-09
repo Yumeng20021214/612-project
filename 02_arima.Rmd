@@ -1,0 +1,147 @@
+---
+title: "02 - ARIMA Modeling for EUR/CNY Exchange Rate"
+subtitle: ECON 612 Time Series Project
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+packages <- c("tidyverse", "forecast", "tseries", "lmtest", "ggplot2")
+for (pkg in packages) {
+  if (!require(pkg, character.only = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}
+
+df <- read_csv("../data/clean/monthly_panel.csv", show_col_types = FALSE)
+```
+
+# 1. 准备时间序列对象
+
+```{r ts-object}
+# 获取起始年月
+start_year  <- year(min(df$date))
+start_month <- month(min(df$date))
+
+fx_ts <- ts(df$log_fx, start = c(start_year, start_month), frequency = 12)
+cat("ts 对象: start =", start_year, "/", start_month,
+    ", length =", length(fx_ts), "\n")
+plot(fx_ts, main = "log(EUR/CNY) Monthly Series", ylab = "log(EUR/CNY)")
+```
+
+# 2. 确认差分阶数 d
+
+```{r diff-order}
+d_adf  <- ndiffs(fx_ts, test = "adf")
+d_kpss <- ndiffs(fx_ts, test = "kpss")
+cat("推荐差分次数 (ADF):", d_adf, "\n")
+cat("推荐差分次数 (KPSS):", d_kpss, "\n")
+```
+
+# 3. ARIMA 选阶
+
+## 3.1 auto.arima（自动选择，作为参考）
+
+```{r auto-arima}
+fit_auto <- auto.arima(fx_ts,
+                       stepwise = FALSE,
+                       approximation = FALSE,
+                       trace = TRUE)
+summary(fit_auto)
+```
+
+## 3.2 手动 Grid Search
+
+```{r grid-search}
+results <- expand.grid(p = 0:4, q = 0:4) %>%
+  mutate(AIC = NA_real_, BIC = NA_real_)
+
+d_use <- max(d_adf, d_kpss, 1)  # 至少差分 1 次
+
+for (i in 1:nrow(results)) {
+  tryCatch({
+    fit <- Arima(fx_ts, order = c(results$p[i], d_use, results$q[i]))
+    results$AIC[i] <- AIC(fit)
+    results$BIC[i] <- BIC(fit)
+  }, error = function(e) {})
+}
+
+cat("=== Top 10 by AIC ===\n")
+print(results %>% filter(!is.na(AIC)) %>% arrange(AIC) %>% head(10))
+
+cat("\n=== Top 10 by BIC ===\n")
+print(results %>% filter(!is.na(BIC)) %>% arrange(BIC) %>% head(10))
+```
+
+# 4. 估计最优 ARIMA 模型
+
+```{r fit-arima}
+# 使用 auto.arima 的结果
+best_order <- arimaorder(fit_auto)
+cat("Best ARIMA order:", best_order, "\n")
+
+fit_arima <- fit_auto  # 或者手动指定: Arima(fx_ts, order = c(p, d, q))
+summary(fit_arima)
+```
+
+## 4.1 系数显著性
+
+```{r coef-test}
+coeftest(fit_arima)
+```
+
+# 5. 残差诊断
+
+## 5.1 残差图
+
+```{r resid-plot, fig.width=10, fig.height=8}
+checkresiduals(fit_arima)
+```
+
+## 5.2 Ljung-Box 检验
+
+```{r ljung-box}
+cat("=== Ljung-Box lag=12 ===\n")
+print(Box.test(residuals(fit_arima), lag = 12, type = "Ljung-Box"))
+
+cat("\n=== Ljung-Box lag=24 ===\n")
+print(Box.test(residuals(fit_arima), lag = 24, type = "Ljung-Box"))
+```
+
+## 5.3 残差正态性
+
+```{r normality, fig.width=6, fig.height=5}
+shapiro.test(residuals(fit_arima))
+
+ggplot(data.frame(resid = as.numeric(residuals(fit_arima))), aes(sample = resid)) +
+  stat_qq() + stat_qq_line(color = "red") +
+  labs(title = "QQ Plot of ARIMA Residuals") +
+  theme_minimal()
+```
+
+## 5.4 残差平方的 ACF（为 GARCH 做铺垫）
+
+```{r resid-sq-acf, fig.width=8, fig.height=4}
+Acf(residuals(fit_arima)^2, main = "ACF of Squared Residuals (ARCH effect?)")
+```
+
+# 6. 保存残差
+
+```{r save-resid}
+arima_resid <- data.frame(
+  date  = df$date,
+  resid = as.numeric(residuals(fit_arima))
+)
+write_csv(arima_resid, "../data/clean/arima_residuals_monthly.csv")
+cat("ARIMA 残差已保存\n")
+cat("Best ARIMA order:", best_order, "\n")
+```
+
+# 7. 小结
+
+> **在这里记录：**
+>
+> - 最优 ARIMA(p,d,q) 阶数及选择依据
+> - 系数是否显著？
+> - 残差是否通过白噪声检验？
+> - 残差平方的 ACF 是否显著？→ 如果有 → 支持 GARCH

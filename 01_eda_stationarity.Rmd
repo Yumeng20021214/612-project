@@ -1,0 +1,178 @@
+---
+title: "01 - Exploratory Data Analysis & Stationarity Tests"
+subtitle: "ECON 612 Time Series Project: EUR/CNY & China-EU Trade"
+output: html_notebook
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+packages <- c("tidyverse", "tseries", "urca", "forecast", "ggplot2", "gridExtra")
+for (pkg in packages) {
+  if (!require(pkg, character.only = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}
+
+df <- read_csv("../data/clean/monthly_panel.csv", show_col_types = FALSE)
+```
+
+# 1. 描述性统计
+
+```{r descriptive}
+vars_of_interest <- c("fx_mean", "fx_sd", "trade", "log_fx", "log_trade")
+
+desc_stats <- df %>%
+  select(all_of(vars_of_interest)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  summarise(
+    n      = sum(!is.na(value)),
+    mean   = mean(value, na.rm = TRUE),
+    sd     = sd(value, na.rm = TRUE),
+    min    = min(value, na.rm = TRUE),
+    q25    = quantile(value, 0.25, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    q75    = quantile(value, 0.75, na.rm = TRUE),
+    max    = max(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(desc_stats)
+```
+
+# 2. 时间趋势可视化
+
+## 2.1 EUR/CNY 汇率
+
+```{r plot-fx, fig.width=10, fig.height=4}
+p1 <- ggplot(df, aes(x = date, y = fx_mean)) +
+  geom_line(color = "steelblue") +
+  labs(title = "EUR/CNY Monthly Mean Exchange Rate",
+       x = NULL, y = "EUR/CNY") +
+  theme_minimal()
+
+p2 <- ggplot(df, aes(x = date, y = log_fx)) +
+  geom_line(color = "steelblue") +
+  labs(title = "Log EUR/CNY",
+       x = NULL, y = "log(EUR/CNY)") +
+  theme_minimal()
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+## 2.2 贸易额
+
+```{r plot-trade, fig.width=10, fig.height=4}
+p3 <- ggplot(df, aes(x = date, y = trade / 1e9)) +
+  geom_line(color = "darkred") +
+  labs(title = "China-EU Monthly Exports",
+       x = NULL, y = "Billion EUR") +
+  theme_minimal()
+
+p4 <- ggplot(df, aes(x = date, y = log_trade)) +
+  geom_line(color = "darkred") +
+  labs(title = "Log China-EU Exports",
+       x = NULL, y = "log(Trade)") +
+  theme_minimal()
+
+grid.arrange(p3, p4, ncol = 2)
+```
+
+## 2.3 汇率月度波动
+
+```{r plot-vol, fig.width=10, fig.height=3}
+ggplot(df, aes(x = date, y = fx_sd)) +
+  geom_line(color = "orange") +
+  geom_smooth(method = "loess", se = FALSE, color = "grey40", linetype = "dashed") +
+  labs(title = "EUR/CNY Monthly Realized Volatility (Std Dev)",
+       x = NULL, y = "Std Dev") +
+  theme_minimal()
+```
+
+# 3. 平稳性检验 (Unit Root Tests)
+
+## 3.1 ADF 检验
+
+```{r adf-function}
+run_adf <- function(x, varname) {
+  test <- adf.test(na.omit(x))
+  cat("===", varname, "===\n")
+  cat("  ADF statistic:", round(test$statistic, 4), "\n")
+  cat("  p-value:      ", round(test$p.value, 4), "\n")
+  cat("  结论:         ", ifelse(test$p.value < 0.05,
+        "平稳 (拒绝H0)", "非平稳 (无法拒绝H0)"), "\n\n")
+  return(test)
+}
+```
+
+### 原始序列（Level）
+
+```{r adf-level}
+adf_fx    <- run_adf(df$log_fx,    "log(EUR/CNY)")
+adf_trade <- run_adf(df$log_trade, "log(Trade)")
+```
+
+### 一阶差分
+
+```{r adf-diff}
+adf_dfx    <- run_adf(diff(df$log_fx),    "Δlog(EUR/CNY)")
+adf_dtrade <- run_adf(diff(df$log_trade), "Δlog(Trade)")
+```
+
+## 3.2 KPSS 检验（作为 ADF 的补充）
+
+```{r kpss}
+cat("=== KPSS: log(EUR/CNY) ===\n")
+print(kpss.test(na.omit(df$log_fx)))
+
+cat("\n=== KPSS: log(Trade) ===\n")
+print(kpss.test(na.omit(df$log_trade)))
+
+cat("\n=== KPSS: Δlog(EUR/CNY) ===\n")
+print(kpss.test(na.omit(diff(df$log_fx))))
+
+cat("\n=== KPSS: Δlog(Trade) ===\n")
+print(kpss.test(na.omit(diff(df$log_trade))))
+```
+
+## 3.3 单位根检验汇总表
+
+```{r summary-table}
+unit_root_summary <- tibble(
+  Variable   = c("log(EUR/CNY)", "log(Trade)", "Δlog(EUR/CNY)", "Δlog(Trade)"),
+  ADF_stat   = round(c(adf_fx$statistic, adf_trade$statistic,
+                        adf_dfx$statistic, adf_dtrade$statistic), 4),
+  ADF_pvalue = round(c(adf_fx$p.value, adf_trade$p.value,
+                        adf_dfx$p.value, adf_dtrade$p.value), 4),
+  Integration = ifelse(c(adf_fx$p.value, adf_trade$p.value,
+                          adf_dfx$p.value, adf_dtrade$p.value) < 0.05,
+                        "I(0)", "I(1)+")
+)
+
+print(unit_root_summary)
+```
+
+# 4. ACF / PACF
+
+```{r acf-fx, fig.width=10, fig.height=8}
+par(mfrow = c(2, 2))
+Acf(df$log_fx, main = "ACF: log(EUR/CNY)")
+Pacf(df$log_fx, main = "PACF: log(EUR/CNY)")
+Acf(diff(df$log_fx), main = "ACF: Δlog(EUR/CNY)")
+Pacf(diff(df$log_fx), main = "PACF: Δlog(EUR/CNY)")
+```
+
+```{r acf-trade, fig.width=10, fig.height=8}
+par(mfrow = c(2, 2))
+Acf(df$log_trade, main = "ACF: log(Trade)")
+Pacf(df$log_trade, main = "PACF: log(Trade)")
+Acf(diff(df$log_trade), main = "ACF: Δlog(Trade)")
+Pacf(diff(df$log_trade), main = "PACF: Δlog(Trade)")
+```
+
+# 5. 小结
+
+> **在这里记录你的发现：**
+>
+> - log(EUR/CNY) 是否 I(1)?
+> - log(Trade) 是否 I(1)?
+> - 差分后是否平稳?
+> - ACF/PACF 图显示了什么模式?

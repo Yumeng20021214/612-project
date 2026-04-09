@@ -1,0 +1,201 @@
+---
+title: "03 - GARCH Volatility Modeling"
+subtitle: ECON 612 Time Series Project
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+packages <- c("tidyverse", "rugarch", "tseries", "FinTS", "ggplot2", "lubridate")
+for (pkg in packages) {
+  if (!require(pkg, character.only = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}
+
+df       <- read_csv("../data/clean/monthly_panel.csv", show_col_types = FALSE)
+fx_daily <- read_csv("../data/clean/daily_fx.csv", show_col_types = FALSE)
+```
+
+# 策略说明
+
+> GARCH 在高频数据上效果更好。策略：
+>
+> 1. 在**日度数据**上拟合 ARIMA-GARCH
+> 2. 提取日度条件方差 σ²ₜ
+> 3. 聚合为**月度均值**，作为 VAR 的"波动率"变量
+
+---
+
+# Part A: 日度 GARCH（主要模型）
+
+## A1. 准备日度对数收益率
+
+```{r daily-returns, fig.width=10, fig.height=4}
+fx_daily <- fx_daily %>%
+  arrange(date) %>%
+  mutate(log_ret = c(NA, diff(log_fx))) %>%
+  filter(!is.na(log_ret))
+
+cat("日度收益率:", nrow(fx_daily), "条\n")
+
+ggplot(fx_daily, aes(x = date, y = log_ret)) +
+  geom_line(color = "grey40", linewidth = 0.3) +
+  labs(title = "EUR/CNY Daily Log Returns",
+       x = NULL, y = "Log Return") +
+  theme_minimal()
+```
+
+## A2. ARCH 效应检验
+
+```{r arch-test-daily}
+cat("=== ARCH-LM Test (lag=5) ===\n")
+print(ArchTest(fx_daily$log_ret, lags = 5))
+
+cat("\n=== ARCH-LM Test (lag=10) ===\n")
+print(ArchTest(fx_daily$log_ret, lags = 10))
+```
+
+## A3. GARCH(1,1) 拟合
+
+```{r garch-fit}
+spec <- ugarchspec(
+  variance.model = list(
+    model      = "sGARCH",
+    garchOrder = c(1, 1)
+  ),
+  mean.model = list(
+    armaOrder    = c(1, 1),
+    include.mean = TRUE
+  ),
+  distribution.model = "norm"
+)
+
+fit_garch <- ugarchfit(spec = spec, data = fx_daily$log_ret)
+fit_garch
+```
+
+## A4. GARCH 模型诊断
+
+```{r garch-diag}
+# 系数
+cat("=== GARCH Coefficients ===\n")
+print(coef(fit_garch))
+
+# 波动持续性
+alpha <- coef(fit_garch)["alpha1"]
+beta  <- coef(fit_garch)["beta1"]
+cat("\nalpha + beta =", alpha + beta, "\n")
+cat("→ 越接近1，波动冲击持续性越强\n")
+```
+
+```{r garch-plots, fig.width=10, fig.height=6}
+# 标准化残差 ACF
+plot(fit_garch, which = 8)
+```
+
+```{r garch-plots2, fig.width=10, fig.height=6}
+# 标准化残差平方 ACF
+plot(fit_garch, which = 9)
+```
+
+```{r garch-qq, fig.width=8, fig.height=6}
+# QQ Plot
+plot(fit_garch, which = 10)
+```
+
+```{r news-impact, fig.width=8, fig.height=6}
+# News Impact Curve
+plot(fit_garch, which = 11)
+```
+
+## A5. 提取条件方差 & 聚合为月度
+
+```{r extract-sigma, fig.width=10, fig.height=4}
+fx_daily$cond_var <- as.numeric(sigma(fit_garch))^2
+
+vol_monthly <- fx_daily %>%
+  mutate(ym = floor_date(date, "month")) %>%
+  group_by(ym) %>%
+  summarise(
+    garch_vol = mean(cond_var, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  rename(date = ym)
+
+ggplot(vol_monthly, aes(x = date, y = garch_vol)) +
+  geom_line(color = "darkorange") +
+  labs(title = "GARCH(1,1) Monthly Conditional Variance",
+       subtitle = "Aggregated from daily estimates",
+       x = NULL, y = expression(sigma^2)) +
+  theme_minimal()
+```
+
+---
+
+# Part B: 月度 ARCH 效应检验（补充）
+
+```{r arch-test-monthly}
+arima_resid <- read_csv("../data/clean/arima_residuals_monthly.csv", show_col_types = FALSE)
+
+cat("=== Monthly ARCH-LM Test (lag=3) ===\n")
+print(ArchTest(arima_resid$resid, lags = 3))
+
+cat("\n=== Monthly ARCH-LM Test (lag=6) ===\n")
+print(ArchTest(arima_resid$resid, lags = 6))
+```
+
+---
+
+# Part C: 模型比较（可选）
+
+```{r model-compare}
+# EGARCH: 捕捉非对称效应
+spec_e <- ugarchspec(
+  variance.model = list(model = "eGARCH", garchOrder = c(1, 1)),
+  mean.model     = list(armaOrder = c(1, 1), include.mean = TRUE),
+  distribution.model = "norm"
+)
+fit_e <- ugarchfit(spec_e, data = fx_daily$log_ret)
+
+# GJR-GARCH
+spec_gjr <- ugarchspec(
+  variance.model = list(model = "gjrGARCH", garchOrder = c(1, 1)),
+  mean.model     = list(armaOrder = c(1, 1), include.mean = TRUE),
+  distribution.model = "norm"
+)
+fit_gjr <- ugarchfit(spec_gjr, data = fx_daily$log_ret)
+
+# 比较
+model_comparison <- tibble(
+  Model = c("sGARCH(1,1)", "eGARCH(1,1)", "gjrGARCH(1,1)"),
+  AIC   = c(infocriteria(fit_garch)[1],
+            infocriteria(fit_e)[1],
+            infocriteria(fit_gjr)[1]),
+  BIC   = c(infocriteria(fit_garch)[2],
+            infocriteria(fit_e)[2],
+            infocriteria(fit_gjr)[2])
+)
+print(model_comparison)
+```
+
+# 保存波动率数据
+
+```{r save}
+df_final <- df %>%
+  left_join(vol_monthly, by = "date")
+
+write_csv(df_final, "../data/clean/monthly_panel_with_vol.csv")
+cat("带 GARCH 波动率的月度面板已保存\n")
+cat("有波动率数据的观测数:", sum(!is.na(df_final$garch_vol)), "\n")
+```
+
+# 小结
+
+> **在这里记录：**
+>
+> - ARCH-LM 检验结果：是否存在 ARCH 效应？
+> - GARCH(1,1) 的 α 和 β 值？α+β 接近 1 吗？
+> - 标准化残差是否干净？
+> - 波动率高的时期对应什么事件？
+> - 三个 GARCH 变体哪个最好？

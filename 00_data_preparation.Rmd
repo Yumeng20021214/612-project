@@ -1,0 +1,136 @@
+---
+title: "00 - Data Preparation"
+subtitle: "ECON 612 Time Series Project: EUR/CNY & China-EU Trade"
+output: html_notebook
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+packages <- c("tidyverse", "lubridate", "zoo")
+for (pkg in packages) {
+  if (!require(pkg, character.only = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}
+```
+
+# 1. 导入原始数据
+
+## 1.1 EUR/CNY 日度汇率 (ECB)
+
+```{r import-fx}
+fx_raw <- read_csv("../data/raw/exchange_rate_final.csv", show_col_types = FALSE)
+
+fx_raw <- fx_raw %>%
+  rename(date = TIME_PERIOD, eurcny = OBS_VALUE) %>%
+  mutate(
+    date   = mdy(date),
+    eurcny = as.numeric(eurcny)
+  ) %>%
+  filter(!is.na(eurcny)) %>%
+  arrange(date)
+
+cat("汇率数据:", nrow(fx_raw), "条\n")
+cat("区间:", as.character(min(fx_raw$date)), "至", as.character(max(fx_raw$date)), "\n")
+head(fx_raw)
+```
+
+## 1.2 中国对欧盟出口（月度贸易额）(Eurostat)
+
+```{r import-trade}
+trade_raw <- read_csv("../data/raw/export_final.csv", show_col_types = FALSE)
+
+trade_raw <- trade_raw %>%
+  rename(month = Month, trade = Export) %>%
+  mutate(
+    date  = ymd(paste0(month, "-01")),
+    trade = as.numeric(trade)
+  ) %>%
+  filter(!is.na(trade)) %>%
+  select(date, trade) %>%
+  arrange(date)
+
+cat("贸易数据:", nrow(trade_raw), "条\n")
+cat("区间:", as.character(min(trade_raw$date)), "至", as.character(max(trade_raw$date)), "\n")
+head(trade_raw)
+```
+
+# 2. 频率对齐：日度汇率 → 月度
+
+```{r freq-align}
+fx_monthly <- fx_raw %>%
+  mutate(ym = floor_date(date, "month")) %>%
+  group_by(ym) %>%
+  summarise(
+    fx_mean = mean(eurcny, na.rm = TRUE),
+    fx_sd   = sd(eurcny, na.rm = TRUE),
+    fx_nobs = n(),
+    .groups = "drop"
+  ) %>%
+  rename(date = ym)
+
+cat("月度汇率:", nrow(fx_monthly), "条\n")
+head(fx_monthly)
+```
+
+# 3. 合并数据集
+
+```{r merge}
+df <- fx_monthly %>%
+  inner_join(trade_raw, by = "date") %>%
+  arrange(date)
+
+cat("合并后样本区间:", as.character(min(df$date)), "至", as.character(max(df$date)), "\n")
+cat("观测数:", nrow(df), "\n")
+```
+
+# 4. 缺失值检查
+
+```{r missing}
+cat("各列缺失值:\n")
+print(colSums(is.na(df)))
+
+# 如果 fx_sd 有缺失（某月只有1个交易日），用线性插值
+if (any(is.na(df$fx_sd))) {
+  df <- df %>%
+    mutate(fx_sd = na.approx(fx_sd, na.rm = FALSE))
+}
+```
+
+# 5. 数据转换
+
+```{r transform}
+df <- df %>%
+  mutate(
+    log_fx    = log(fx_mean),
+    log_trade = log(trade)
+  )
+
+head(df)
+```
+
+# 6. 快速可视化
+
+```{r quick-plot, fig.width=10, fig.height=6}
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
+plot(df$date, df$fx_mean, type = "l", col = "steelblue",
+     main = "EUR/CNY Monthly Mean", xlab = "", ylab = "EUR/CNY")
+plot(df$date, df$trade / 1e9, type = "l", col = "darkred",
+     main = "China-EU Monthly Exports (Billion)", xlab = "", ylab = "Billion")
+```
+
+# 7. 保存清洗后的数据
+
+```{r save-monthly}
+write_csv(df, "../data/clean/monthly_panel.csv")
+cat("月度面板数据已保存: data/clean/monthly_panel.csv\n")
+```
+
+# 8. 保存日度汇率（供 GARCH 使用）
+
+```{r save-daily}
+fx_daily <- fx_raw %>%
+  mutate(log_fx = log(eurcny))
+
+write_csv(fx_daily, "../data/clean/daily_fx.csv")
+cat("日度汇率数据已保存: data/clean/daily_fx.csv\n")
+cat("日度数据量:", nrow(fx_daily), "条\n")
+```

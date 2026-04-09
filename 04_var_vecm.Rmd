@@ -1,0 +1,268 @@
+---
+title: "04 - VAR / VECM Modeling, IRF & Granger Causality"
+subtitle: ECON 612 Time Series Project
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+packages <- c("tidyverse", "vars", "urca", "tseries", "ggplot2", "lmtest")
+for (pkg in packages) {
+  if (!require(pkg, character.only = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}
+
+select <- dplyr::select
+
+df <- read_csv("../data/clean/monthly_panel_with_vol.csv", show_col_types = FALSE)
+```
+```{r}
+colnames(df)
+```
+
+# 1. 准备变量
+
+```{r prepare-vars}
+# 三个核心变量:
+#   log_fx     = log(EUR/CNY)
+#   garch_vol  = GARCH 条件方差
+#   log_trade  = log(出口额)
+
+var_data <- df %>%
+  dplyr::select(date, log_fx, garch_vol, log_trade) %>%
+  drop_na()
+
+cat("观测数:", nrow(var_data), "\n")
+cat("样本区间:", as.character(min(var_data$date)), "至",
+    as.character(max(var_data$date)), "\n")
+```
+
+# 2. 平稳性确认
+
+```{r stationarity-check}
+cat("=== ADF: log_fx ===\n")
+print(adf.test(var_data$log_fx))
+
+cat("\n=== ADF: garch_vol ===\n")
+print(adf.test(var_data$garch_vol))
+
+cat("\n=== ADF: log_trade ===\n")
+print(adf.test(var_data$log_trade))
+
+# 差分后
+cat("\n=== ADF: Δlog_fx ===\n")
+print(adf.test(diff(var_data$log_fx)))
+
+cat("\n=== ADF: Δlog_trade ===\n")
+print(adf.test(diff(var_data$log_trade)))
+```
+
+# 3. 协整检验（关键分岔点）
+
+```{r johansen}
+# 对 I(1) 变量做 Johansen 协整检验
+# 注意: garch_vol 可能已经是 I(0)，先看上面 ADF 结果
+
+y_level <- var_data %>%
+  select(log_fx, log_trade) %>%
+  as.matrix()
+
+# Trace test
+jo_trace <- ca.jo(y_level, type = "trace", ecdet = "const", K = 4)
+cat("=== Johansen Trace Test ===\n")
+summary(jo_trace)
+```
+
+```{r johansen-eigen}
+# Max eigenvalue test
+jo_eigen <- ca.jo(y_level, type = "eigen", ecdet = "const", K = 4)
+cat("=== Johansen Max Eigenvalue Test ===\n")
+summary(jo_eigen)
+```
+
+> **根据上面的检验结果，选择路径 A (VAR) 或路径 B (VECM)。**
+> 如果 trace 统计量 > 临界值 → 存在协整 → 路径 B。
+
+---
+
+# 4A. 路径 A：VAR 模型（无协整）
+
+对 I(1) 变量取差分后建 VAR。
+
+```{r var-data-prep}
+var_diff <- var_data %>%
+  mutate(
+    d_log_fx    = c(NA, diff(log_fx)),
+    d_log_trade = c(NA, diff(log_trade))
+  ) %>%
+  drop_na() %>%
+  select(d_log_fx, garch_vol, d_log_trade)
+```
+
+```{r var-lag-select}
+lag_select <- VARselect(var_diff, lag.max = 12, type = "const")
+cat("=== Lag Selection ===\n")
+print(lag_select$selection)
+```
+
+```{r var-fit}
+# 用 AIC 推荐的 lag（也可以用 BIC 的）
+optimal_lag <- lag_select$selection["AIC(n)"]
+cat("选择 lag =", optimal_lag, "\n")
+
+var_fit <- VAR(var_diff, p = optimal_lag, type = "const")
+summary(var_fit)
+```
+
+# 4B. 路径 B：VECM 模型（有协整）
+
+如果协整检验显著，用以下代码替代路径 A。
+
+```{r vecm-fit}
+# ----- 取消注释以使用 VECM -----
+# 如果要在 VAR 系统中包含 garch_vol，需要把它也加进去:
+# y_all <- var_data %>%
+#   select(log_fx, garch_vol, log_trade) %>%
+#   as.matrix()
+# jo_all <- ca.jo(y_all, type = "trace", ecdet = "const", K = 4)
+# summary(jo_all)
+
+# vecm_fit <- cajorls(jo_trace, r = 1)   # r = 协整秩
+# summary(vecm_fit$rlm)
+
+# 转换为 VAR 形式（做 IRF 用）:
+# var_from_vecm <- vec2var(jo_trace, r = 1)
+```
+
+# 5. 模型诊断
+
+```{r diagnostics}
+# 使用 var_fit（路径A）或 var_from_vecm（路径B）
+model <- var_fit
+
+# 残差自相关
+cat("=== Serial Correlation Test ===\n")
+print(serial.test(model, lags.pt = 12, type = "PT.asymptotic"))
+
+# 残差正态性
+cat("\n=== Normality Test ===\n")
+print(normality.test(model, multivariate.only = TRUE))
+
+# ARCH 效应
+cat("\n=== ARCH Test ===\n")
+print(arch.test(model, lags.multi = 5))
+```
+
+```{r stability, fig.width=8, fig.height=6}
+# 稳定性: 特征根应在单位圆内
+cat("特征根模:\n")
+print(roots(model))
+cat("全部 < 1?", all(roots(model) < 1), "\n")
+```
+
+# 6. Granger 因果检验
+
+```{r granger}
+cat("=== garch_vol → d_log_trade? ===\n")
+print(causality(var_fit, cause = "garch_vol"))
+
+cat("\n=== d_log_fx → d_log_trade? ===\n")
+print(causality(var_fit, cause = "d_log_fx"))
+
+cat("\n=== d_log_trade → garch_vol? (反向) ===\n")
+print(causality(var_fit, cause = "d_log_trade"))
+```
+
+# 7. 脉冲响应函数 (IRF)
+
+```{r irf-vol, fig.width=10, fig.height=6}
+# 波动率冲击 → 贸易额
+irf_vol2trade <- irf(model,
+                      impulse  = "garch_vol",
+                      response = "d_log_trade",
+                      n.ahead  = 12,
+                      ortho    = TRUE,
+                      boot     = TRUE,
+                      ci       = 0.95,
+                      runs     = 1000)
+plot(irf_vol2trade,
+     main = "Response of Trade to Volatility Shock")
+```
+
+```{r irf-fx, fig.width=10, fig.height=6}
+# 汇率冲击 → 贸易额
+irf_fx2trade <- irf(model,
+                     impulse  = "d_log_fx",
+                     response = "d_log_trade",
+                     n.ahead  = 12,
+                     ortho    = TRUE,
+                     boot     = TRUE,
+                     ci       = 0.95,
+                     runs     = 1000)
+plot(irf_fx2trade,
+     main = "Response of Trade to Exchange Rate Shock")
+```
+
+## 7.1 自定义 IRF 图（论文用）
+
+```{r irf-ggplot, fig.width=8, fig.height=5}
+irf_data <- data.frame(
+  period = 0:12,
+  irf    = as.numeric(irf_vol2trade$irf$garch_vol[, "d_log_trade"]),
+  lower  = as.numeric(irf_vol2trade$Lower$garch_vol[, "d_log_trade"]),
+  upper  = as.numeric(irf_vol2trade$Upper$garch_vol[, "d_log_trade"])
+)
+
+ggplot(irf_data, aes(x = period)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper),
+              fill = "steelblue", alpha = 0.2) +
+  geom_line(aes(y = irf), color = "steelblue", linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_x_continuous(breaks = 0:12) +
+  labs(
+    title = "Impulse Response: Volatility Shock → Trade",
+    subtitle = "Response of Δlog(Trade) to 1 SD shock in GARCH Volatility",
+    x = "Months After Shock",
+    y = "Response"
+  ) +
+  theme_minimal()
+```
+
+# 8. 方差分解
+
+```{r fevd, fig.width=10, fig.height=6}
+fevd_result <- fevd(model, n.ahead = 12)
+plot(fevd_result)
+
+# 贸易额的方差分解
+cat("=== Forecast Error Variance Decomposition: d_log_trade ===\n")
+print(fevd_result$d_log_trade)
+```
+
+# 9. 稳健性检验（可选）
+
+```{r robustness, fig.width=10, fig.height=6}
+# Generalized IRF（不依赖 Cholesky 顺序）
+irf_gen <- irf(model,
+               impulse  = "garch_vol",
+               response = "d_log_trade",
+               n.ahead  = 12,
+               ortho    = FALSE,
+               boot     = TRUE,
+               runs     = 1000)
+plot(irf_gen,
+     main = "Generalized IRF: Volatility → Trade")
+```
+
+# 10. 小结
+
+> **核心发现：**
+>
+> - 协整检验结果 → 选了 VAR 还是 VECM？
+> - Granger 因果：波动率是否显著 Granger-cause 贸易额？
+> - IRF：
+>   - 波动率冲击对贸易额的影响方向（正/负）？
+>   - 峰值在第几个月？
+>   - 多久消退？
+> - 对跨境支付企业和政策制定者的含义？
