@@ -1,0 +1,1162 @@
+---
+title: "Exchange_rate"
+author: "Yumeng"
+date: "2026-04-08"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: false
+    number_sections: false
+---
+
+# 612 Time Series Project
+
+## Exchange Rate Estimation
+
+Package requirements:
+
+```{r setup, message=FALSE, warning=FALSE}
+# install.packages("quantmod")
+# install.packages("fredr")
+# install.packages("ggfortify")
+# install.packages('urca')
+# install.packages("tseries")
+# install.packages("forecast")
+# install.packages("dynlm")
+# install.packages("stargazer")
+# install.packages("pracma")
+# install.packages("dLagM")
+# install.packages("gets")
+# install.packages("car")
+# install.packages("lmtest")
+# install.packages("vars")
+# install.packages("devtools", type = "binary")
+# install.packages("tsDyn")
+# install.packages('fGarch', type = "binary")
+
+options(warn=-1)
+```
+
+library requirements:
+
+```{r}
+library(fGarch)    # For GARCH modeling
+library(xts)
+library(urca)
+library(stargazer) # For formatted regression output
+library(ggplot2)
+library(ggfortify)
+library(scales)
+library(patchwork)
+library(forecast)  # For auto.arima()
+library(aTSA)      # For testing for the ARCH effect
+library(rugarch)
+library(lubridate)
+library(vars)
+```
+
+```{r}
+# Import the datasets
+fx = read.csv('https://raw.githubusercontent.com/Yumeng20021214/612-project/refs/heads/Yumeng/exchange_rate_final.csv')
+
+# tranfer TIME_PERIOD to Date format
+fx$TIME_PERIOD = as.Date(fx$TIME_PERIOD, format = "%m/%d/%Y")
+
+print(head(fx))
+print(tail(fx))
+print(anyNA(fx))
+print(str(fx))
+```
+
+```{r}
+# create time series object
+fx_xts = xts(fx$OBS_VALUE, order.by = fx$TIME_PERIOD)
+colnames(fx_xts) = "OBS_VALUE" 
+```
+
+```{r}
+dlogfx = diff(log(fx_xts))  # Compute difference in log exchange rate
+head(dlogfx)               # Show first six fx change rate
+tail(dlogfx)               # Show last six fx change rate
+rfx = na.omit(dlogfx)   # Remove missing values (from first difference)
+
+summary(ur.df(rfx, type='trend', lags=8, selectlags="AIC"))
+```
+
+#### Interpretation of the unit root test
+
+Test statistics ( type = "trend" )
+
+$\phi_3$ = 1379.367 vs. 5% critical value = 6.25 $\to$ Reject $H_0$ (deterministic trend = 0) $\to$ a deterministic trend should be included.
+
+$\tau_3$ = -52.5236 vs. 5% critical value = -3.41 $\to$ Reject $H_0$ (no unit root).
+
+Conclusion：The specification including a deterministic trend is appropriate and provides evidence of no unit root in EUR/CNY exchange rate returns.
+
+```{r}
+# Create a deterministic time trend
+t=1:length(rfx)
+# Regress PCE growth rate on the time trend
+model = lm(rfx ~ t)
+# Display regression results in text format
+stargazer(model, type = "text")
+```
+
+#### Interpretation of the trend regression
+
+Model: $y_t$ = $\alpha$ + $\beta_t$ + $\varepsilon_t$
+
+The estimated trend coefficient ($\beta$) is approximately 0.00000. The coefficient is not statistically significant (p $>$ 0.1). This means there is no significant deterministic trend in the return series.
+
+Conclusion: The EUR/CNY exchange rate returns are stationary with no deterministic trend to remove. The mean of returns remains constant over time, and any fluctuations are random rather than systematic.
+
+```{r}
+rfx_df = data.frame(
+  Date = index(rfx),
+  Return = as.numeric(rfx)
+)
+
+fig <- ggplot(rfx_df, aes(x = Date, y = Return)) +
+  geom_line(color = "peru", linewidth = 0.2) +
+  theme_light() +
+  theme(
+    aspect.ratio = 0.4,
+    plot.margin = ggplot2::margin(0.8, 1.2, 0.8, 0.8, "cm"),
+    text = element_text(size = 12),
+    axis.title = element_text(size = 13, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+    axis.text.y = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    x = "Year",
+    y = "EUR/CNY Exchange Rate Return"
+  ) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y",
+    expand = c(0.01, 0)
+  ) +
+  scale_y_continuous(
+    labels = scales::scientific
+  )
+
+fig
+```
+
+#### Interpretation of volatility patterns
+
+The figure displays daily EUR/CNY exchange rate returns over a long sample period. The series fluctuates around zero, but the size of the fluctuations changes substantially over time, indicating that volatility is not constant.
+
+2005-2006：Volatility in 2005–2006 was relatively moderate, but it was influenced by important structural changes in China’s exchange-rate regime. In 2005, China moved away from the long-standing strict U.S. dollar peg and began shifting toward a more market-based, managed floating system, which increased the role of market forces in RMB pricing.
+
+2008–2009: Volatility rises sharply during the global financial crisis, with much larger positive and negative movements than in earlier years. This is one of the most turbulent periods, and several extreme spikes are visible.
+
+2010–2012: Volatility declines compared with the crisis period, but fluctuations remain more pronounced than in the pre-2008 years, indicating that market uncertainty is still present.
+
+2015–2016: Volatility rose markedly, largely because of China’s exchange-rate reform, concerns about China’s slowing growth, capital outflow pressures, and uncertainty in global financial markets.
+
+Around 2022: Volatility increased again, mainly because of the conflict between Russian and Ukraine, the resulting energy shock in Europe, and heightened inflation and policy uncertainty.
+
+Around 2025: Volatility after 2025 can be linked to elevated trade-policy uncertainty, tariff shocks, and broader geopolitical tensions.
+
+Overall, the plot suggests that EUR/CNY exchange rate volatility is not constant, but instead tends to increase during periods of economic or financial stress. The visible clustering of large and small movements provides preliminary evidence in favor of using a GARCH-type model to capture time-varying volatility.
+
+### Testing for ARCH Effect
+
+#### Method A: Plot of the squared series
+
+```{r}
+rfx2_df = data.frame(
+  Date = index(rfx),
+  Squared_Returns = as.numeric(rfx^2)
+)
+
+fig <- ggplot(rfx2_df, aes(x = Date, y = Squared_Returns)) +
+  geom_line(color = "peru", linewidth = 0.2) +
+  theme_light() +
+  theme(
+    aspect.ratio = 0.4,
+    plot.margin = ggplot2::margin(0.8, 1.2, 0.8, 0.8, "cm"),
+    text = element_text(size = 12),
+    axis.title = element_text(size = 13, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+    axis.text.y = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    x = "Year",
+    y = "Squared Returns"
+  ) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y",
+    expand = c(0.01, 0)
+  ) +
+  scale_y_continuous(
+    labels = scales::scientific
+  )
+
+fig
+```
+
+#### Interpretation of the plot of squared returns
+
+We observe moderate EUR/CNY return volatility during the early part of the sample. However, volatility increases noticeably during several periods, especially around 2008–2009, 2015–2016, and 2025, where large spikes appear more frequently, indicating episodes of heightened exchange-rate uncertainty.
+
+Additional periods of elevated volatility are visible in 2010–2012, when squared returns remain more dispersed even after the global financial crisis. Other noticeable increase appears around 2020, likely reflecting the disruption caused by the COVID-19 pandemic, and around 2022, indicating the impact of the Russia-Ukraine conflict. Outside these episodes, volatility tends to be lower, with squared returns clustering closer to zero.
+
+Overall, the plot suggests the presence of volatility clustering, as periods of low volatility are followed by low volatility and periods of high volatility are followed by high volatility. This pattern indicates that the variance of EUR/CNY returns is not constant over time and supports the use of a GARCH-type model to capture time-varying volatility.
+
+#### Method B: ACF plot of the squared series
+
+```{r}
+options(repr.plot.width=8, repr.plot.height=8)
+acf(rfx^2) 
+```
+
+#### Interpretation of the ACF plot of squared returns
+
+The ACF of squared returns shows positive autocorrelations at the first several lags, and many of these values remain above the confidence bands. Although the autocorrelations gradually decline as the lag increases, they do not disappear immediately and stay positive for quite a number of lags.
+
+This pattern indicates that dependence in the squared returns is persistent rather than short-lived. In other words, periods of high volatility tend to be followed by high volatility, while periods of low volatility tend to be followed by low volatility. This provides evidence of volatility clustering in the EUR/CNY return series.
+
+Overall, the ACF plot suggests the presence of conditional heteroskedasticity and gives support for ARCH/GARCH-type effects. Therefore, a GARCH-type model appears appropriate for capturing the time-varying volatility in this series.
+
+#### Method C: Plot of the squared residuals
+
+#### Estimate conditional mean model
+
+```{r}
+auto.arima(rfx, 
+           max.d = 0,         # no differencing allowed (series already made stationary)
+           max.p = 20,        # maximum AR order (p)
+           max.q = 20,        # maximum MA order (q)
+           seasonal = FALSE,  # do not allow for seasonal components
+           ic = "aic",        # choose the model that minimizes AIC
+           stationary = TRUE, # restricts attention to stationary AR dynamics
+           stepwise = FALSE   # ensures an (almost) exhaustive search
+)
+```
+
+```{r}
+# Estimate AR(1) and save the output to a variable model.rfx
+model.rfx = arima(rfx, order=c(1,0,0))   
+
+# Extract residuals
+res.rfx = model.rfx$residuals
+
+# Transform the vector of residuals into a time series object
+res.rfx = xts(res.rfx, order.by = index(rfx))
+```
+
+```{r}
+# Squared returns
+rfx2_df = data.frame(
+  Date = index(rfx),
+  Squared_Returns = as.numeric(rfx^2)
+)
+
+fig <- ggplot(rfx2_df, aes(x = Date, y = Squared_Returns)) +
+  geom_line(color = "peru", linewidth = 0.2) +
+  theme_light() +
+  theme(
+    aspect.ratio = 0.4,
+    plot.margin = ggplot2::margin(0.8, 1.2, 0.8, 0.8, "cm"),
+    text = element_text(size = 12),
+    axis.title = element_text(size = 13, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+    axis.text.y = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    x = "Year",
+    y = "Squared Returns"
+  ) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y",
+    expand = c(0.01, 0)
+  ) +
+  scale_y_continuous(
+    labels = scales::scientific
+  )
+
+fig
+
+# Squared residuals
+rfx3_df = data.frame(
+  Date = index(rfx),
+  Squared_Residuals = as.numeric(res.rfx^2)
+)
+
+fig <- ggplot(rfx3_df, aes(x = Date, y = Squared_Residuals)) +
+  geom_line(color = "peru", linewidth = 0.2) +
+  theme_light() +
+  theme(
+    aspect.ratio = 0.4,
+    plot.margin = ggplot2::margin(0.8, 1.2, 0.8, 0.8, "cm"),
+    text = element_text(size = 12),
+    axis.title = element_text(size = 13, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+    axis.text.y = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    x = "Year",
+    y = "Squared Residuals"
+  ) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y",
+    expand = c(0.01, 0)
+  ) +
+  scale_y_continuous(
+    labels = scales::scientific
+  )
+
+fig
+```
+
+#### Interpretation of the plot of squared residuals
+
+The squared residuals closely resemble the squared returns, indicating that the estimated mean model (AR(1)) removes very little variation from the original series. This suggests that the predictable component in the mean is small, and most of the dynamics are driven by the innovation term.
+
+#### Method D: Plot ACF of the squared residuals
+
+```{r}
+options(repr.plot.width=8, repr.plot.height=8)
+acf(res.rfx^2) 
+```
+
+#### Interpretation of the ACF plot of squared residuals
+
+The ACF of squared residuals shows positive autocorrelations at the first several lags, and many of these autocorrelations remain above the confidence bands. Although the values decline gradually as the lag increases, they stay positive across a fairly wide range of lags, indicating that the dependence does not disappear immediately.
+
+This pattern is very similar to the ACF of squared returns, suggesting that modeling the mean equation does not remove the volatility dependence in the series. In other words, periods of high volatility are still followed by high volatility, and periods of low volatility are still followed by low volatility, which points to persistent volatility clustering in the residuals.
+
+Overall, the results suggest the presence of conditional heteroskedasticity in the residual series, meaning that the variance is still time-varying even after accounting for the mean dynamics. This provides support for ARCH/GARCH-type effects and indicates that a GARCH-type model is appropriate for capturing the remaining volatility structure.
+
+#### Method E: Engle’s ARCH-LM Test
+
+```{r}
+# Engle’s ARCH-LM on residuals (null: no ARCH). Small p-value - model volatility (ARCH/GARCH)
+aTSA::arch.test(model.rfx)
+```
+
+#### Interpretation of ARCH test results
+
+Portmanteau-Q test:
+
+All p-values are equal to 0. We reject the null hypothesis of no autocorrelation in squared residuals at all tested lags. This indicates strong evidence of volatility clustering.
+
+Lagrange Multiplier (LM) test:
+
+All p-values are equal to 0. The null hypothesis of no ARCH effects is strongly rejected at every lag. The very large LM statistics suggest very strong ARCH effects.
+
+Conclusion: There is clear and strong evidence of conditional heteroskedasticity (ARCH effects). The variance of the residuals is not constant over time. A GARCH-type model is appropriate to model the data
+
+### Estimating ARMA-GARCH Model
+
+```{r}
+spec = ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model     = list(armaOrder = c(1, 0), include.mean = TRUE),
+  distribution.model = "norm"
+)
+garch.dfx = ugarchfit(spec, rfx)
+garch.dfx@fit$matcoef 
+infocriteria(garch.dfx)
+```
+
+#### Interpretation of the AR(1)-GARCH(1,1) Model
+
+The table reports the estimation results for an AR(1)-GARCH(1,1) model for EUR/CNY exchange rate returns. The AR component captures linear dependence in the mean equation, while the GARCH component models time-varying volatility (conditional variance).
+
+Mean Equation, AR(1)
+
+$\mu$ (constant): The mean is estimated at -5.54 × $10^{-5}$ and is not statistically significant (p = 0.339), suggesting that the average EUR/CNY return is very close to zero and not systematically different from zero.
+
+AR term (ar1 = -0.037$^{***}$): Negative and statistically significant (p $<$ 0.01), indicating a small degree of short-run mean reversion in exchange rate returns. A positive return in the previous period is, on average, followed by a slightly negative adjustment in the current period.
+
+Variance Equation, GARCH(1,1)
+
+$\omega$ (omega = 9.25 × $10^{-8}$): Positive but not statistically significant (p = 0.593), suggesting that the baseline variance is very small and not precisely estimated. This is not unusual when volatility persistence is very high.
+
+$\alpha$ (alpha1 = 0.0319$^{***}$): Measures the immediate impact of recent shocks (ARCH effect). Its high significance indicates that new shocks increase current volatility, providing evidence of volatility clustering.
+
+$\beta$ (beta1 = 0.9647$^{***}$): Measures persistence in volatility (GARCH effect). The coefficient is very large and highly significant, implying that volatility shocks decay very slowly over time and that conditional variance is highly persistent.
+
+Conclusion
+
+The model suggests that the mean dynamics of EUR/CNY exchange rate returns are weak but not entirely absent, with a significant negative AR(1) term indicating slight short-run mean reversion. More importantly, the variance equation provides strong evidence of volatility clustering and very high persistence, as shown by the significant ARCH and GARCH terms. Overall, the volatility of EUR/CNY exchange rate returns is clearly time-varying and highly persistent, which is typical for financial return series.
+
+#### Removing mean and re-estimating ARMA-GARCH model
+
+```{r}
+spec2 = ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(1, 0), include.mean = FALSE),
+  distribution.model = "norm"
+)
+garch.dfx2 = ugarchfit(spec2, rfx)
+garch.dfx2@fit$matcoef
+infocriteria(garch.dfx2)
+```
+
+In the zero-mean AR(1)-GARCH(1,1) model, the results are nearly unchanged: the AR(1), ARCH, and GARCH coefficients remain significant, and the information criteria show only a very small improvement. This indicates that the average EUR/CNY return is close to zero and that including a mean term does not materially improve model fit. Therefore, for simplicity and parsimony, We use the zero-mean AR(1)-GARCH(1,1) specification in the final analysis.
+
+#### Using student’s t-distribution in place of the normal distribution
+
+```{r}
+spec3 = ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(1, 0), include.mean = FALSE),
+  distribution.model = "std"
+)
+garch.dfx3 = ugarchfit(spec3, rfx)
+garch.dfx3@fit$matcoef
+infocriteria(garch.dfx3)
+```
+
+#### Interpretation of the AR(1)-GARCH(1,1) Model with Student’s t Distribution
+
+The table reports the estimation results for a zero-mean AR(1)-GARCH(1,1) model with Student’s t-distributed errors for EUR/CNY exchange rate returns. The AR component captures short-run dependence in the conditional mean, while the GARCH component models time-varying volatility in the conditional variance.
+
+Mean Equation, AR(1)
+
+AR term (ar1 = -0.0386$^{***}$): Negative and statistically significant (p \< 0.01), indicating a small degree of short-run mean reversion in EUR/CNY exchange rate returns.
+
+Variance Equation, GARCH(1,1)
+
+$\omega$ (omega = 9.62 × $10^{-8}$): Positive but not statistically significant, suggesting that the baseline variance is very small and imprecisely estimated. This is not unusual when volatility persistence is very high.
+
+$\alpha$ (alpha1 = 0.0342$^{***}$): Measures the immediate effect of recent shocks on current volatility. Its high significance indicates clear evidence of volatility clustering.
+
+$\beta$ (beta1 = 0.9627$^{***}$): Measures volatility persistence. The large and highly significant coefficient implies that volatility shocks decay very slowly over time, indicating highly persistent conditional variance.
+
+Shape parameter (shape = 6.19$^{***}$):The estimated degrees of freedom parameter is statistically significant, indicating that the residual distribution is heavy-tailed. This supports the use of the Student’s t distribution rather than the normal distribution.
+
+Conclusion
+
+The model shows that EUR/CNY exchange rate returns exhibit weak but significant short-run mean reversion, as captured by the negative AR(1) coefficient. More importantly, the variance equation provides strong evidence of volatility clustering and high persistence. The lower information criteria relative to the normal-error specification suggest that the Student’s t distribution provides a better fit, implying that the return series has heavier tails than would be expected under normality.
+
+#### Residual Diagnostics
+
+```{r}
+Box.test(residuals(garch.dfx3, standardize = TRUE), lag = 8, type = "Ljung-Box")
+```
+
+```{r}
+Box.test(residuals(garch.dfx3, standardize = TRUE)^2, lag = 8, type = "Ljung-Box")
+```
+
+The Ljung–Box test on the standardized residuals yields a p-value of 0.441, so we fail to reject the null hypothesis of no autocorrelation up to lag 8. This suggests that the mean equation is well specified and that no substantial serial dependence remains in the residuals. In addition, the Ljung–Box test on the squared standardized residuals gives a p-value of 0.7862, indicating that there is no significant remaining ARCH effect. Overall, the residual diagnostics suggest that the selected AR(1)-GARCH(1,1) model with Student’s t errors provides an adequate fit to the EUR/CNY returns series.
+
+## Estimating relationship between exchange rates and trade
+
+```{r}
+# Extract daily volatility from the GARCH model
+vol_daily = sigma(garch.dfx3)^2
+head(vol_daily)
+tail(vol_daily)
+```
+
+```{r}
+vol_daily_df = data.frame(
+  Date = index(vol_daily),
+  Volatility = as.numeric(vol_daily)
+)
+
+ggplot(vol_daily_df, aes(x = Date, y = Volatility)) +
+  geom_line(color = "peru", linewidth = 0.4) +
+  theme_light() +
+  theme(
+    aspect.ratio = 0.4,
+    plot.margin = ggplot2::margin(0.8, 1.2, 0.8, 0.8, "cm"),
+    text = element_text(size = 12),
+    axis.title = element_text(size = 13, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+    axis.text.y = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    x = "Year",
+    y = "Daily GARCH Variance"
+  ) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y",
+    expand = c(0.01, 0)
+  ) +
+  scale_y_continuous(
+    labels = scientific
+  )
+```
+
+```{r}
+# Convert daily exchange rate volatility to monthly exchange rate volatility
+vol_monthly = apply.monthly(vol_daily, colMeans)
+index(vol_monthly) = ceiling_date(index(vol_monthly), "month") - days(1)
+
+head(vol_monthly)
+tail(vol_monthly)
+```
+
+```{r}
+# Convert daily exchange rate level to monthly exchange rate level
+level_monthly = apply.monthly(fx_xts, colMeans)
+index(level_monthly) = ceiling_date(index(level_monthly), "month") - days(1)
+
+head(level_monthly)
+tail(level_monthly)
+```
+
+```{r}
+# Import trade data
+trade = read.csv("https://raw.githubusercontent.com/Yumeng20021214/612-project/refs/heads/Yumeng/export_final.csv")
+
+# Convert trade data
+trade$Month  = as.Date(paste0(trade$Month, "-01"))
+trade$Month  = ceiling_date(trade$Month, "month") - days(1)
+trade$Export = as.numeric(trade$Export)
+xts_trade = xts(trade$Export, order.by = trade$Month)
+
+class(xts_trade)
+head(xts_trade)
+tail(xts_trade)
+anyNA(xts_trade)
+```
+
+```{r}
+trade$Export <- as.numeric(trade$Export)
+trade <- trade[!is.na(trade$Export), ]
+xts_trade <- xts(trade$Export, order.by = trade$Month)
+
+class(xts_trade)
+head(xts_trade)
+tail(xts_trade)
+anyNA(xts_trade)
+```
+
+```{r}
+# Merge data
+data_all = merge(vol_monthly, level_monthly, xts_trade)
+data_all = na.omit(data_all)
+
+colnames(data_all) = c("volatility", "level", "trade")
+
+head(data_all)
+tail(data_all)
+```
+
+```{r}
+# Plot data
+# Volatility
+vol_monthly_df = data.frame(
+  Date = index(data_all),
+  Volatility = as.numeric(data_all$volatility)
+)
+
+ggplot(vol_monthly_df, aes(x = Date, y = Volatility)) +
+  geom_line(color = "peru", linewidth = 0.6) +
+  theme_light() +
+  theme(
+    aspect.ratio = 0.4,
+    plot.margin = ggplot2::margin(0.8, 1.2, 0.8, 0.8, "cm"),
+    text = element_text(size = 12),
+    axis.title = element_text(size = 13, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+    axis.text.y = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    x = "Year",
+    y = "Monthly GARCH Variance"
+  ) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y",
+    expand = c(0.01, 0)
+  ) +
+  scale_y_continuous(
+    labels = scientific
+  )
+
+# Level
+level_monthly_df = data.frame(
+  Date = index(data_all),
+  Level = as.numeric(data_all$level)
+)
+
+ggplot(level_monthly_df, aes(x = Date, y = Level)) +
+  geom_line(color = "steelblue", linewidth = 0.6) +
+  theme_light() +
+  theme(
+    aspect.ratio = 0.4,
+    plot.margin = ggplot2::margin(0.8, 1.2, 0.8, 0.8, "cm"),
+    text = element_text(size = 12),
+    axis.title = element_text(size = 13, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+    axis.text.y = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    x = "Year",
+    y = "Monthly EUR/CNY Exchange Rate"
+  ) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y",
+    expand = c(0.01, 0)
+  )
+
+# Trade
+trade_monthly_df = data.frame(
+  Date = index(data_all),
+  Log_Trade = log(as.numeric(data_all$trade))
+)
+
+ggplot(trade_monthly_df, aes(x = Date, y = Log_Trade)) +
+  geom_line(color = "seagreen4", linewidth = 0.6) +
+  theme_light() +
+  theme(
+    aspect.ratio = 0.4,
+    plot.margin = ggplot2::margin(0.8, 1.2, 0.8, 0.8, "cm"),
+    text = element_text(size = 12),
+    axis.title = element_text(size = 13, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+    axis.text.y = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    x = "Year",
+    y = "Log Monthly Export"
+  ) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y",
+    expand = c(0.01, 0)
+  )
+```
+
+### Testing for Unit Root
+
+```{r}
+level = data_all$level
+trade = data_all$trade
+vol = data_all$volatility
+```
+
+#### ADF test for exchange rate volatility
+
+```{r}
+summary(ur.df(vol,type = "trend", lags = 8, selectlags = "AIC"))
+```
+
+#### Interpretation of the unit root test
+
+Test statistics ( type = "trend" )
+
+$\phi_3$ = 12.1939 vs. 5% critical value = 6.49 $\to$ Reject $H_0$ (deterministic trend = 0) $\to$ a deterministic trend should be included.
+
+$\tau_3$ = -4.9337 vs. 5% critical value = −3.43 $\to$ Reject $H_0$ (no unit root).
+
+Conclusion
+
+The specification including a deterministic trend is appropriate and provides evidence of no unit root in EUR/CNY exchange rate returns volatility.
+
+```{r}
+# Create a deterministic time trend
+t=1:length(vol)
+# Regress PCE growth rate on the time trend
+vol_model = lm(vol ~ t)
+# Display regression results in text format
+stargazer(vol_model, type = "text")
+```
+
+#### Interpretation of the linear trend in volatility
+
+We regress the volatility series (`vol`) on a deterministic time trend to assess whether a systematic linear trend is present over time.
+
+The coefficient on the time trend is negative and statistically significant (`-0.00000***`), indicating that volatility shows a downward deterministic trend over the sample period.
+
+Although the estimated coefficient appears numerically very small because the volatility measure itself is on a very small scale, the statistical significance suggests that the decline is not random noise.
+
+The $R^2$ = 0.135 indicates that the deterministic time trend explains about 13.5% of the variation in volatility, which is modest but non-negligible.
+
+Conclusion
+
+There is evidence of a meaningful negative deterministic trend in the volatility series. Therefore, detrending may be appropriate.
+
+In other words, the volatility series should not be treated as a stationary series around a constant mean without first considering the time trend.
+
+#### Detrend volatility
+
+```{r fig.width=14, fig.height=5, warning=FALSE, message=FALSE}
+# Organize the data
+vol_monthly_df = data.frame(
+  Date = index(data_all),
+  Volatility = as.numeric(data_all$volatility)
+)
+
+# Create a linear time trend
+vol_monthly_df$t = 1:nrow(vol_monthly_df)
+
+# Regress volatility on the time trend
+vol_model = lm(Volatility ~ t, data = vol_monthly_df)
+
+# Extract estimated coefficients
+vol_coef = coef(vol_model)
+
+# Detrend the series following the lecture method:
+# subtract slope * t while keeping the level
+vol_monthly_df$Volatility_detrended =
+  vol_monthly_df$Volatility - vol_coef[2] * vol_monthly_df$t
+
+# Define a common plot theme
+my_theme <- theme_light() +
+  theme(
+    aspect.ratio = 0.4,
+    plot.margin = ggplot2::margin(0.6, 0.8, 0.6, 0.6, "cm"),
+    text = element_text(size = 11),
+    plot.title = element_text(size = 13, face = "bold"),
+    axis.title = element_text(size = 12, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    panel.grid.minor = element_blank()
+  )
+
+# Plot the original volatility series
+p1 <- ggplot(vol_monthly_df, aes(x = Date, y = Volatility)) +
+  geom_line(color = "peru", linewidth = 0.7) +
+  labs(
+    title = "Monthly GARCH Variance (Original)",
+    x = "Year",
+    y = "Variance"
+  ) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y",
+    expand = c(0.01, 0)
+  ) +
+  scale_y_continuous(labels = label_scientific()) +
+  my_theme
+
+# Plot the detrended volatility series
+p2 = ggplot(vol_monthly_df, aes(x = Date, y = Volatility_detrended)) +
+  geom_line(color = "red3", linewidth = 0.7) +
+  labs(
+    title = "Monthly GARCH Variance (Detrended)",
+    x = "Year",
+    y = "Detrended variance"
+  ) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y",
+    expand = c(0.01, 0)
+  ) +
+  scale_y_continuous(labels = label_scientific()) +
+  my_theme
+
+# Display the two plots side by side
+p1 + p2
+```
+
+#### ADF test for detrended volatility
+
+```{r}
+vol_detr = xts(vol_monthly_df$Volatility_detrended, order.by = vol_monthly_df$Date)
+
+summary(ur.df(vol_detr, type = "drift", lags = 8, selectlags = "AIC"))
+```
+
+#### Interpretation of the unit root test
+
+Test statistics (type = "drift")
+
+$\tau_2$ = −4.9366 vs. 5% critical value = −2.88 $\to$ Reject $H_0$ (unit root)
+
+$\phi_1$ = 12.1877 vs. 5% critical value = 4.63 $\to$ Reject $H_0$ (drift = 0) $\to$ a constant should be included
+
+Conclusion
+
+The test strongly rejects the null hypothesis of a unit root, indicating that the detrended volatility series is stationary.This suggests that, after removing the deterministic trend, the volatility series fluctuates around a stable mean and can be treated as an I(0) process.
+
+#### ADF test for exchange rate level
+
+```{r}
+summary(ur.df(level, type = "trend", lags = 8, selectlags = "AIC"))
+```
+
+#### Interpretation of the unit root test
+
+Test statistics ( type = "trend" )
+
+$\phi_3$ = 1.8609 vs. 5% critical value = 6.49 $\to$ Do not reject $H_0$ (deterministic trend = 0) → a deterministic trend should not be included.
+
+$\phi_2$ = 1.3464 vs. 5% critical value = 4.75 $\to$ Do not reject $H_0$ (deterministic drift = 0) → a deterministic drift should not be included.
+
+$\tau_3$ = -1.7601 vs. 5% critical value = −3.43 $\to$ Do not reject $H_0$ (unit root).
+
+```{r}
+summary(ur.df(level, type = "none", lags = 8, selectlags = "AIC"))
+```
+
+#### Interpretation of the unit root test
+
+Test statistics ( type = "none" )
+
+$\tau_1$ = -0.7616 vs. 5% critical value = -1.95 → Do not reject $H_0$ (unit root).
+
+Conclusion
+
+The earlier ADF test with `type = "trend"` suggests that neither a deterministic trend nor a drift term should be included. We therefore re-estimate the test using `type = "none"`. The test statistic remains far above the critical value, so we do not reject the null hypothesis of a unit root. Therefore, the trade series is non-stationary.
+
+We take the natural logarithm of the variable in order to transform multiplicative errors into additive errors, which is a standard assumption in time series modeling. Taking first differences of the log series then allows us to test whether the growth rate of the variable is stationary.
+
+```{r}
+# Transform the series into (approximate) monthly growth rates in percentage points
+dloglevel = diff(log(level)) * 100
+dloglevel = na.omit(dloglevel)
+
+# Perform an Augmented Dickey-Fuller (ADF) test for a unit root
+summary(ur.df(dloglevel, type='trend', lags=8, selectlags="AIC"))
+```
+
+#### Interpretation of the second unit root test
+
+Test statistics ( type = "trend" )
+
+$\phi_3$ = 21.3982 vs. 5% critical value = 6.49 $\to$ Reject $H_0$ (deterministic trend = 0) $\to$ a deterministic trend should be included.
+
+$\tau_3$ = -6.5418 vs. 5% critical value = −3.43 $\to$ Reject $H_0$ (unit root).
+
+Conclusion
+
+The specification including a deterministic trend is appropriate. The ADF test indicates that the series has no second unit root and is therefore $I(1)$.
+
+Now, we need to verify whether the inclusion of a deterministic trend is justified, given both its statistical and economic significance. To do so, we regress the EUR/CNY exchange rate returns on a deterministic time trend and inspect the estimated coefficient before deciding whether to detrend the data or include a deterministic trend in further analysis.
+
+```{r}
+# Create a deterministic time trend
+t=1:length(dloglevel)
+# Regress PCE growth rate on the time trend
+model = lm(dloglevel ~ t)
+# Display regression results in text format
+stargazer(model, type = "text")
+```
+
+#### Interpretation of the linear trend in growth rates
+
+We regress the first difference of the log series (`dloglevel`) on a deterministic time trend to assess whether a remaining deterministic trend is present after differencing.
+
+The coefficient on the time trend (`0.002`) is statistically insignificant but economically negligible. The $R^2$ = 0.007 indicates that the deterministic trend explains virtually none of the variation in the growth rate.
+
+Conclusion
+
+There is no meaningful deterministic trend in the differenced (growth rate) series. Therefore, detrending is not necessary. Combined with the earlier unit root test results, this suggests that the first-differenced log series is stationary without a deterministic trend.
+
+#### ADF test for trade
+
+```{r}
+# Perform an Augmented Dickey-Fuller (ADF) test for a unit root
+summary(ur.df(trade, type='trend', lags=8, selectlags="AIC"))
+```
+
+#### Interpretation of the unit root test
+
+Test statistics ( type = "trend" )
+
+$\phi_3$ = 2.7435 vs. 5% critical value = 6.49 $\to$ Do not reject $H_0$ (deterministic trend = 0) → a deterministic trend should not be included.
+
+$\phi_2$ = 2.8369 vs. 5% critical value = 4.75 $\to$ Do not reject $H_0$ (deterministic drift = 0) → a deterministic drift should not be included.
+
+$\tau_3$ = -2.3223 vs. 5% critical value = −3.43 $\to$ Do not reject $H_0$ (unit root).
+
+```{r}
+summary(ur.df(trade, type='none', lags=8, selectlags="AIC"))
+```
+
+#### Interpretation of the unit root test
+
+Test statistics ( type = "none" )
+
+$\tau_1$ = 1.3736 vs. 5% critical value = -1.95 $\to$ Do not reject $H_0$ (unit root).
+
+Conclusion
+
+The earlier ADF test with `type = "trend"` suggests that neither a deterministic trend nor a drift term should be included. We therefore re-estimate the test using `type = "none"`. The test statistic remains far above the critical value, so we do not reject the null hypothesis of a unit root. Therefore, the trade series is non-stationary.
+
+We next take the natural logarithm of the trade series and then its first difference in order to examine whether the growth rate of trade is stationary.
+
+```{r}
+# Transform the series into (approximate) monthly growth rates in percentage points
+dlogtrade = diff(log(trade)) * 100
+dlogtrade = na.omit(dlogtrade)
+
+# Perform an Augmented Dickey-Fuller (ADF) test for a unit root
+summary(ur.df(dlogtrade, type='trend', lags=8, selectlags="AIC"))
+```
+
+#### Interpretation of the second unit root test
+
+Test statistics ( type = "trend" )
+
+$\phi_3$ = 40.3568 vs. 5% critical value = 6.49 $\to$ Reject $H_0$ (deterministic trend = 0) $\to$ a deterministic trend should be included.
+
+$\tau_3$ = -8.984 vs. 5% critical value = −3.43 $\to$ Reject $H_0$ (unit root).
+
+Conclusion
+
+The specification including a deterministic trend is appropriate. The ADF test indicates that the series has no second unit root and is therefore $I(1)$.
+
+Now, we need to verify whether the inclusion of a deterministic trend is justified, given both its statistical and economic significance. To do so, we regress the trade growth rate on a deterministic time trend and inspect the estimated coefficient before deciding whether to detrend the data or include a deterministic trend in further analysis.
+
+```{r}
+# Create a deterministic time trend
+t=1:length(dlogtrade)
+# Regress PCE growth rate on the time trend
+model = lm(dlogtrade ~ t)
+# Display regression results in text format
+stargazer(model, type = "text")
+```
+
+#### Interpretation of the linear trend in growth rates
+
+We regress the first difference of the log series (`dlogtrade`) on a deterministic time trend to assess whether a remaining deterministic trend is present after differencing.
+
+The coefficient on the time trend (`-0.003`) is statistically insignificant but economically negligible. The $R^2$ = 0.001 indicates that the deterministic trend explains virtually none of the variation in the growth rate.
+
+Conclusion
+
+There is no meaningful deterministic trend in the differenced (growth rate) series. Therefore, detrending is not necessary. The first-differenced log series can be treated as stationary without a deterministic trend.
+
+### Testing for Cointegration Relationships
+
+Since exchange rate volatility appears to be integrated of order 0, while exchange rate level and trade appear to be integrated of order 1, we do not include exchange rate volatility in a standard VECM. Instead, we test for a cointegrating relationship between exchange rate level and trade only.
+
+Because we are considering only two variables, we could use either the Engle–Granger residual-based test or the Johansen test.
+
+#### The Johansen test
+
+We start by determining the lag length of the VAR in levels for exchange rate level and trade. Since the series display no trending behavior, we allow for a constant in the specification. According to the information criteria, the VAR in levels should include 2 lags.
+
+```{r}
+# Equation-by-equation estimation
+llevel = log(data_all$level)
+ltrade = log(data_all$trade)
+
+data_vecm = na.omit(cbind(llevel, ltrade))
+colnames(data_vecm) = c("llevel", "ltrade")
+
+# Choose the lag order of the VAR in levels using a specification with a constant
+VARselect(data_vecm, lag.max = 8, type = "const")$selection
+```
+
+We therefore carry out the Johansen test with and ecdet="const" . Here, $K$=2 is chosen because the underlying VAR in levels includes 2 lags, and ecdet="const" reflects there is no deterministic trend or drift the system.
+
+```{r}
+ca.jo = ca.jo(data_vecm, ecdet = "const", type="trace", K=2, spec="longrun", season=NULL, dumvar = NULL)
+summary(ca.jo)
+```
+
+The Johansen trace test is sequential. We begin by testing the null hypothesis of no cointegrating relationship, r = 0, against the alternative r \> 0. The test statistic is 11.70. This is below the 5% critical value of 19.96, so we do not reject the null hypothesis at the 5% level.
+
+```{r}
+ca.jo = ca.jo(data_vecm, ecdet = "const", type="eigen", K=2, spec="longrun", season=NULL, dumvar = NULL)
+summary(ca.jo)
+```
+
+We then take Johansen eigen test. The test statistic is 6.16. This is below the 5% critical value of 15.67, so we do not reject the null hypothesis at the 5% level.
+
+We therefore conclude that there is no evidence of a cointegrating relationship between consumption and net worth at the 5% significance level.
+
+### Estimation of a VAR Model
+
+```{r}
+data_var = na.omit(cbind(vol_detr, dloglevel, dlogtrade))
+colnames(data_var) = c("vol_detr", "dloglevel", "dlogtrade")
+
+head(data_var)
+tail(data_var)
+```
+
+```{r}
+# Choose VAR lag order (up to 8) including an intercept ("const")
+VARselect(data_var, lag.max = 8, type = "const")$selection
+```
+
+The lag-order selection criteria for the VAR in stationary variables suggest a parsimonious specification with 2 lags according to both the Schwarz criterion (SC) and the Hannan–Quinn criterion (HQ). We therefore estimate a VAR(2) model.
+
+```{r}
+var_model = VAR(data_var, p = 2, type = "const")
+summary(var_model)
+```
+
+The estimated VAR(2) model is stable, as all roots of the characteristic polynomial lie inside the unit circle.
+
+In the volatility equation, lagged volatility terms are highly significant, indicating strong persistence in exchange-rate risk. In the exchange-rate growth equation, lagged volatility terms are significant, suggesting that changes in volatility affect subsequent exchange-rate movements.
+
+However, in the trade-growth equation, neither lagged volatility nor lagged exchange-rate growth is statistically significant. Instead, trade growth is mainly explained by its own lagged values, which are negative and significant, indicating mean-reverting dynamics.
+
+Overall, these results suggest that exchange-rate volatility does not have a strong direct short-run effect on trade growth at the monthly frequency.
+
+```{r}
+# Test for residual autocorrelation
+serial.test(var_model, lags.pt = 12, type = "PT.asymptotic")
+```
+
+The Portmanteau test rejects the null hypothesis of no residual autocorrelation (p\<0.001), indicating that the VAR(2) model does not fully capture the dynamic dependence in the data. Therefore, a higher lag order should be considered.
+
+```{r}
+for (p in 2:6) {
+  cat("\n===== VAR(", p, ") =====\n", sep = "")
+  model_p <- VAR(data_var, p = p, type = "const")
+  print(serial.test(model_p, lags.pt = 12, type = "PT.asymptotic"))
+  print(roots(model_p))
+}
+```
+
+Residual Portmanteau tests reject the null of no residual autocorrelation for VAR specifications with 2 to 6 lags. Although all models are dynamically stable, the remaining serial correlation suggests that the baseline VAR does not fully capture the dependence structure in the data. This may reflect omitted seasonal dynamics or other forms of misspecification. We therefore retain a parsimonious baseline specification and interpret subsequent impulse-response and causality results with caution.
+
+```{r}
+var_model2_season = VAR(data_var, p = 2, type = "const", season = 12)
+serial.test(var_model2_season, lags.pt = 12, type = "PT.asymptotic")
+roots(var_model2_season)
+```
+
+```{r}
+var_model3_season = VAR(data_var, p = 3, type = "const", season = 12)
+serial.test(var_model3_season, lags.pt = 12, type = "PT.asymptotic")
+roots(var_model3_season)
+```
+
+Residual Portmanteau tests continue to reject the null of no residual autocorrelation even after allowing for additional lags and monthly seasonal dummies. Although all estimated VAR specifications remain dynamically stable, the residual diagnostics suggest that the model does not fully capture the dependence structure in the data. We therefore retain a parsimonious baseline specification and interpret subsequent causality and impulse-response results with caution.
+
+### Granger Causality
+
+```{r}
+causality(var_model, cause = "vol_detr")
+causality(var_model, cause = "dloglevel")
+causality(var_model, cause = "dlogtrade")
+```
+
+The Granger-causality tests suggest that detrended exchange-rate volatility has significant predictive power for the other endogenous variables in the VAR system (p\<0.001). Exchange-rate growth also Granger-causes the remaining variables (p\<0.001). In contrast, trade growth does not Granger-cause volatility or exchange-rate growth (p=0.627). These results suggest that the direction of dynamic dependence mainly runs from financial variables to trade, rather than the reverse.
+
+### Impulse Response Function
+
+#### Volatility shock $\to$ trade growth
+
+```{r}
+irf_vol_trade = irf(var_model,
+                     impulse = "vol_detr",
+                     response = "dlogtrade",
+                     n.ahead = 12,
+                     boot = TRUE,
+                     ci = 0.95,
+                     runs = 1000
+                      )
+
+plot(irf_vol_trade)
+```
+
+The impulse response function indicates that a positive shock to detrended exchange-rate volatility is followed by a short-run decline in trade growth. The response remains slightly negative for several periods and gradually converges back to zero. However, the 95% bootstrap confidence bands include zero throughout the horizon, suggesting that the negative effect is not statistically significant.
+
+#### Volatility shock $\to$ exchange-rate growth
+
+```{r}
+irf_vol_level <- irf(var_model,
+                     impulse = "vol_detr",
+                     response = "dloglevel",
+                     n.ahead = 12,
+                     boot = TRUE,
+                     ci = 0.95,
+                     runs = 1000)
+
+plot(irf_vol_level)
+```
+
+A positive volatility shock generates a pronounced negative response in exchange-rate growth in the short run. The response then recovers, becomes mildly positive in the medium run, and gradually dies out over time. This suggests that volatility shocks primarily affect exchange-rate dynamics through short-run adjustment rather than through a persistent long-run effect.
+
+### Pseudo Out-of-Sample Forecasting
+
+```{r}
+T = nrow(data_var)
+train_size = floor(0.8 * T)
+
+train_data = data_var[1:train_size, ]
+test_data  = data_var[(train_size+1):T, ]
+```
+
+```{r}
+p = 2 
+
+forecast_trade = c()
+actual_trade  = test_data[, "dlogtrade"]
+
+for (i in 1:nrow(test_data)) {
+  
+  # expanding window
+  train_subset = data_var[1:(train_size + i - 1), ]
+  
+  # re-estimate VAR
+  model = VAR(train_subset, p = p, type = "const")
+  
+  # 1-step forecasting
+  fc = predict(model, n.ahead = 1)
+  
+  # extract dlogtrade prediction
+  forecast_trade[i] = fc$fcst$dlogtrade[1, "fcst"]
+}
+```
+
+```{r}
+errors <- actual_trade - forecast_trade
+
+# MAE
+MAE = mean(abs(errors))
+
+# RMSFE
+RMSFE = sqrt(mean(errors^2))
+
+MAE
+RMSFE
+```
+
+```{r}
+library(ggplot2)
+
+actual_forecast_df <- data.frame(
+  Date = index(actual_trade),
+  Actual = as.numeric(actual_trade),
+  Forecast = as.numeric(forecast_trade)
+)
+
+ggplot(actual_forecast_df, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual"), linewidth = 0.8) +
+  geom_line(aes(y = Forecast, color = "Forecast"), linewidth = 0.8, linetype = "dashed") +
+  scale_color_manual(values = c("Actual" = "black", "Forecast" = "red")) +
+  theme_light() +
+  theme(
+    aspect.ratio = 0.4,
+    plot.margin = ggplot2::margin(0.8, 1.2, 0.8, 0.8, "cm"),
+    text = element_text(size = 12),
+    axis.title = element_text(size = 13, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+    axis.text.y = element_text(size = 11),
+    legend.title = element_blank(),
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "Actual vs Forecast (Trade Growth)",
+    x = "Year",
+    y = "dlogtrade"
+  ) +
+  scale_x_date(
+    date_breaks = "6 months",
+    date_labels = "%b\n%Y",
+    expand = c(0.01, 0)
+  )
+```
